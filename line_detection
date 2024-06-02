@@ -1,0 +1,197 @@
+import math
+import cv2
+import numpy as np
+import scipy.spatial as spatial
+import scipy.cluster as cluster
+from collections import defaultdict
+from statistics import mean
+import matplotlib.pyplot as plt
+import os
+
+from PIL import Image
+import re
+import glob
+import PIL
+kernel = np.ones((5, 5), np.uint8)
+
+
+
+def threshold_image(image, threshold_value):
+    _, thresh_image = cv2.threshold(image, threshold_value, 255, cv2.THRESH_BINARY)
+    return thresh_image
+
+
+def canny_edge(img, sigma=0.33):
+    v = np.median(img)
+    lower = int(max(0, (1.0 - sigma) * v))
+    upper = int(min(255, (1.0 + sigma) * v))
+    edges = cv2.Canny(img, lower, upper)
+    return edges
+
+def getSaddle(gray_img):
+    img = gray_img.astype(np.float64)
+    gx = cv2.Sobel(img,cv2.CV_64F,1,0)
+    gy = cv2.Sobel(img,cv2.CV_64F,0,1)
+    gxx = cv2.Sobel(gx,cv2.CV_64F,1,0)
+    gyy = cv2.Sobel(gy,cv2.CV_64F,0,1)
+    gxy = cv2.Sobel(gx,cv2.CV_64F,0,1)
+    
+    S = gxx*gyy - gxy**2
+    return S
+    
+def hough_line(edges, min_line_length=100, max_line_gap=10):
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 50, minLineLength=min_line_length, maxLineGap=max_line_gap)
+    return lines
+
+def extend_line(image, x1, y1, x2, y2):
+    height, width = image.shape[:2]
+    if x1 == x2:  # vertical line
+        return (x1, 0, x2, height - 1)
+    elif y1 == y2:  # horizontal line
+        return (0, y1, width - 1, y2)
+    else:
+        slope = (y2 - y1) / (x2 - x1)
+        intercept = y1 - slope * x1
+        x_top = 0
+        y_top = int(intercept)
+        x_bottom = width - 1
+        y_bottom = int(slope * x_bottom + intercept)
+        y_left = 0
+        x_left = int(-intercept / slope)
+        y_right = height - 1
+        x_right = int((y_right - intercept) / slope)
+        
+        points = [(x_top, y_top), (x_bottom, y_bottom), (x_left, y_left), (x_right, y_right)]
+        points = [(x, y) for x, y in points if 0 <= x < width and 0 <= y < height]
+        
+        if len(points) < 2:
+            return (x1, y1, x2, y2)
+        return (*points[0], *points[1])
+
+def draw_lines(image, lines):
+    if lines is not None:
+        for line in lines:
+            for x1, y1, x2, y2 in line:
+                extended_line = extend_line(image, x1, y1, x2, y2)
+                cv2.line(image, (extended_line[0], extended_line[1]), (extended_line[2], extended_line[3]), (0, 0, 255), 2)
+
+def separate_lines(lines):
+    horizontal_lines = []
+    vertical_lines = []
+    if lines is not None:
+        for line in lines:
+            for x1, y1, x2, y2 in line:
+                angle = np.arctan2(y2 - y1, x2 - x1)
+                if abs(angle) < np.pi / 8 or abs(angle) > 5 * np.pi / 8:  # close to horizontal
+                    horizontal_lines.append(line)
+                elif np.pi / 2.5 < abs(angle) < 2 * np.pi / 2.5:  # close to vertical
+                    vertical_lines.append(line)
+    return horizontal_lines, vertical_lines
+
+def segment_lines(lines, delta):
+    h_lines = []
+    v_lines = []
+    for line in lines:
+        for x1, y1, x2, y2 in line:
+            if abs(x2-x1) < delta: # x-values are near; line is vertical
+                v_lines.append((x1,y1,x2,y2))
+            elif abs(y2-y1) < delta: # y-values are near; line is horizontal
+                h_lines.append((x1, y1, x2, y2))
+    return h_lines, v_lines
+    
+
+
+
+def draw_lines(img, lines, color=(0, 255, 0)):
+    """Draws lines on the image."""
+    for line in lines:
+        x1, y1, x2, y2 = line
+        cv2.line(img, (x1, y1), (x2, y2), color, 2)
+    return img
+
+
+def find_intersection(h_lines, v_lines):
+    """Finds the intersection points between horizontal and vertical lines."""
+    intersections = []
+    for h_line in h_lines:
+        x1, y1, x2, y2 = h_line
+        for v_line in v_lines:
+            x3, y3, x4, y4 = v_line
+            det = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+            if det != 0:
+                px = ((x1*y2 - y1*x2) * (x3 - x4) - (x1 - x2) * (x3*y4 - y3*x4)) / det
+                py = ((x1*y2 - y1*x2) * (y3 - y4) - (y1 - y2) * (x3*y4 - y3*x4)) / det
+                intersections.append((px, py))
+    return intersections
+    
+def cluster_points(intersections, nclusters):
+    """Clusters the intersection points using k-means clustering."""
+    if not intersections:
+        return []
+    
+    intersections = np.array(intersections, dtype=np.float32)  # Ensure points is a numpy array of type float32
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+    _, labels, centers = cv2.kmeans(intersections, nclusters, None, criteria, 100, cv2.KMEANS_PP_CENTERS)
+    return centers
+
+
+def main():
+    # Load image
+    image = cv2.imread('/filepath', cv2.IMREAD_GRAYSCALE)
+    
+
+    S = getSaddle
+    thresh_image = threshold_image(image,150)
+
+    # Apply Canny Edge Detection
+    edges = canny_edge(thresh_image, sigma=0.8)
+
+    # Apply Hough Transform
+    lines = hough_line(edges, min_line_length=50, max_line_gap=75)
+    
+    # Separate lines into horizontal and vertical
+    h_lines, v_lines = segment_lines(lines,20)
+    
+    #find intersections
+    intersections = find_intersection(h_lines, v_lines)
+
+
+    image_with_horizontal_lines = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    image_with_vertical_lines = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    
+    # Draw horizontal lines on the image
+    draw_lines(image_with_horizontal_lines, h_lines)
+    
+    # Draw vertical lines on the image
+    draw_lines(image_with_vertical_lines, v_lines)
+
+    for point in intersections:
+        cv2.circle(image_with_horizontal_lines, (int(point[0]), int(point[1])), 5, (0, 0, 255), -1)
+
+
+    # Display the result
+    plt.figure(figsize=(20, 10))
+    
+    plt.subplot(1, 5, 2)
+    plt.title("Canny Edge Detection")
+    plt.imshow(edges, cmap='gray')
+    
+
+    plt.subplot(1, 5, 3)
+    plt.title("Threshold")
+    plt.imshow(thresh_image, cmap='gray')
+    
+    plt.subplot(1, 5, 4)
+    plt.title("Horizontal Lines")
+    plt.imshow(cv2.cvtColor(image_with_horizontal_lines, cv2.COLOR_BGR2RGB))
+    
+    
+    plt.subplot(1, 5, 5)
+    plt.title("Vertical Lines")
+    plt.imshow(cv2.cvtColor(image_with_vertical_lines, cv2.COLOR_BGR2RGB))  
+    print(len(intersections))
+    print(len(centers))
+    
+
+if __name__ == "__main__":
+    main()      
