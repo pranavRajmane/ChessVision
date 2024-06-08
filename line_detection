@@ -138,9 +138,8 @@ def cluster_points(intersections, nclusters):
 def main():
     # Load image
     image = cv2.imread('/filepath', cv2.IMREAD_GRAYSCALE)
-    
 
-    S = getSaddle
+    #apply thresholding
     thresh_image = threshold_image(image,150)
 
     # Apply Canny Edge Detection
